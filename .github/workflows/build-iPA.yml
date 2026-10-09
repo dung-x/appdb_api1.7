@@ -1,0 +1,128 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    name: Build IPA
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Show available SDKs
+        run: xcodebuild -showsdks
+
+      - name: Install CocoaPods (if Podfile exists)
+        run: |
+          if [ -f "Podfile" ]; then
+            gem install cocoapods
+            pod install
+            echo "USE_WORKSPACE=true" >> $GITHUB_ENV
+          else
+            echo "USE_WORKSPACE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Build archive (no signing)
+        run: |
+          if [ "$USE_WORKSPACE" = "true" ]; then
+            BUILD_CMD="xcodebuild archive \
+              -workspace appdb.xcworkspace \
+              -scheme appdb \
+              -configuration ${{ github.event.inputs.configuration }} \
+              -destination 'generic/platform=iOS' \
+              -archivePath ${{ runner.temp }}/appdb.xcarchive \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGN_IDENTITY='' \
+              CODE_SIGNING_REQUIRED=NO \
+              DEVELOPMENT_TEAM=''"
+          else
+            BUILD_CMD="xcodebuild archive \
+              -project appdb.xcodeproj \
+              -scheme appdb \
+              -configuration ${{ github.event.inputs.configuration }} \
+              -destination 'generic/platform=iOS' \
+              -archivePath ${{ runner.temp }}/appdb.xcarchive \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGN_IDENTITY='' \
+              CODE_SIGNING_REQUIRED=NO \
+              DEVELOPMENT_TEAM=''"
+          fi
+          eval $BUILD_CMD
+
+      - name: Export IPA (unsigned)
+        run: |
+          mkdir -p ${{ runner.temp }}/ipa
+
+          # Create minimal export options plist
+          cat > ${{ runner.temp }}/ExportOptions.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath ${{ runner.temp }}/appdb.xcarchive \
+            -exportOptionsPlist ${{ runner.temp }}/ExportOptions.plist \
+            -exportPath ${{ runner.temp }}/ipa \
+            || true
+
+          # Fallback: manually package .app into .ipa if export failed
+          APP_PATH=$(find ${{ runner.temp }}/appdb.xcarchive -name "*.app" | head -n 1)
+          if [ -z "$(find ${{ runner.temp }}/ipa -name '*.ipa' 2>/dev/null)" ] && [ -n "$APP_PATH" ]; then
+            echo "Using manual IPA packaging fallback..."
+            mkdir -p ${{ runner.temp }}/ipa_payload/Payload
+            cp -r "$APP_PATH" ${{ runner.temp }}/ipa_payload/Payload/
+            cd ${{ runner.temp }}/ipa_payload
+            zip -r ${{ runner.temp }}/ipa/appdb.ipa Payload
+            cd -
+          fi
+
+      - name: List IPA output
+        run: ls -lh ${{ runner.temp }}/ipa/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appdb-ipa-${{ github.event.inputs.configuration }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/ipa/*.ipa
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload Archive artifact (fallback)
+        uses: actions/upload-artifact@v4
+        with:
+          name: appdb-xcarchive-${{ github.run_number }}
+          path: ${{ runner.temp }}/appdb.xcarchive
+          retention-days: 3
+          if-no-files-found: warn

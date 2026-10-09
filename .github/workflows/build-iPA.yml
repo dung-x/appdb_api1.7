@@ -27,8 +27,9 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Show available SDKs
-        run: xcodebuild -showsdks
+      - name: List schemes
+        run: |
+          xcodebuild -project appdb.xcodeproj -list
 
       - name: Install CocoaPods (if Podfile exists)
         run: |
@@ -40,89 +41,50 @@ jobs:
             echo "USE_WORKSPACE=false" >> $GITHUB_ENV
           fi
 
-      - name: Build archive (no signing)
+      - name: Resolve Swift Package dependencies
         run: |
-          if [ "$USE_WORKSPACE" = "true" ]; then
-            BUILD_CMD="xcodebuild archive \
-              -workspace appdb.xcworkspace \
-              -scheme appdb \
-              -configuration ${{ github.event.inputs.configuration }} \
-              -destination 'generic/platform=iOS' \
-              -archivePath ${{ runner.temp }}/appdb.xcarchive \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGN_IDENTITY='' \
-              CODE_SIGNING_REQUIRED=NO \
-              DEVELOPMENT_TEAM=''"
-          else
-            BUILD_CMD="xcodebuild archive \
-              -project appdb.xcodeproj \
-              -scheme appdb \
-              -configuration ${{ github.event.inputs.configuration }} \
-              -destination 'generic/platform=iOS' \
-              -archivePath ${{ runner.temp }}/appdb.xcarchive \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGN_IDENTITY='' \
-              CODE_SIGNING_REQUIRED=NO \
-              DEVELOPMENT_TEAM=''"
-          fi
-          eval $BUILD_CMD
-
-      - name: Export IPA (unsigned)
-        run: |
-          mkdir -p ${{ runner.temp }}/ipa
-
-          # Create minimal export options plist
-          cat > ${{ runner.temp }}/ExportOptions.plist << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>development</string>
-            <key>compileBitcode</key>
-            <false/>
-            <key>signingStyle</key>
-            <string>manual</string>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>thinning</key>
-            <string>&lt;none&gt;</string>
-          </dict>
-          </plist>
-          EOF
-
-          xcodebuild -exportArchive \
-            -archivePath ${{ runner.temp }}/appdb.xcarchive \
-            -exportOptionsPlist ${{ runner.temp }}/ExportOptions.plist \
-            -exportPath ${{ runner.temp }}/ipa \
+          xcodebuild -project appdb.xcodeproj \
+            -scheme appdb \
+            -resolvePackageDependencies \
             || true
 
-          # Fallback: manually package .app into .ipa if export failed
-          APP_PATH=$(find ${{ runner.temp }}/appdb.xcarchive -name "*.app" | head -n 1)
-          if [ -z "$(find ${{ runner.temp }}/ipa -name '*.ipa' 2>/dev/null)" ] && [ -n "$APP_PATH" ]; then
-            echo "Using manual IPA packaging fallback..."
-            mkdir -p ${{ runner.temp }}/ipa_payload/Payload
-            cp -r "$APP_PATH" ${{ runner.temp }}/ipa_payload/Payload/
-            cd ${{ runner.temp }}/ipa_payload
-            zip -r ${{ runner.temp }}/ipa/appdb.ipa Payload
-            cd -
-          fi
+      - name: Build archive (no signing)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project appdb.xcodeproj \
+            -scheme appdb \
+            -configuration ${{ github.event.inputs.configuration }} \
+            -destination 'generic/platform=iOS' \
+            -archivePath ${{ runner.temp }}/appdb.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee build.log | xcpretty --color --report junit \
+            || (cat build.log && exit 1)
 
-      - name: List IPA output
-        run: ls -lh ${{ runner.temp }}/ipa/
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Package IPA manually
+        run: |
+          mkdir -p ${{ runner.temp }}/ipa/Payload
+          APP_PATH=$(find ${{ runner.temp }}/appdb.xcarchive -name "*.app" | head -n 1)
+          echo "Found app: $APP_PATH"
+          cp -r "$APP_PATH" ${{ runner.temp }}/ipa/Payload/
+          cd ${{ runner.temp }}/ipa
+          zip -r ../appdb.ipa Payload
+          echo "IPA created at: ${{ runner.temp }}/appdb.ipa"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: appdb-ipa-${{ github.event.inputs.configuration }}-${{ github.run_number }}
-          path: ${{ runner.temp }}/ipa/*.ipa
+          path: ${{ runner.temp }}/appdb.ipa
           retention-days: 7
-          if-no-files-found: warn
-
-      - name: Upload Archive artifact (fallback)
-        uses: actions/upload-artifact@v4
-        with:
-          name: appdb-xcarchive-${{ github.run_number }}
-          path: ${{ runner.temp }}/appdb.xcarchive
-          retention-days: 3
           if-no-files-found: warn
